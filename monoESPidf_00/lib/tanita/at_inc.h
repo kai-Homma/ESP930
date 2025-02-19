@@ -70,4 +70,16 @@
 // #include	"func.h"					/* ファンクション					*/
 #include	"main.h"					/* メイン							*/
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_adc/adc_continuous.h"
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "driver/i2c.h"
+
+#include "adc.h"
+#include "lcd.h"
 
