@@ -1,0 +1,541 @@
+main.c
+void	MtrPon(void)
+{
+	enum	EVT_ID	Event;				/* イベント							*/
+/* clk02 del start															*/
+/*	uchar	ucRet;						 * リターンコード					*/
+/* clk02 del end															*/
+
+	m_intctrl(INT_DI);					/* 割込み禁止						*/
+	m_mcschg();							/* メインクロックへ切り替え			*/
+	m_reginit(ON);						/* レジスタ初期化(電源ON)			*/
+	TmpRamClr();						/* 一時ＲＡＭクリア					*/
+	StsChg(MSTS_PON);					/* 状態＝電源ON						*/
+	m_poweron();						/* 電源ON							*/
+
+	m_clkchk();							/* クロック動作チェック				*/
+
+//	if(BLE.ucSTS == OK)					/* 通信状態ＯＫ(＝通信起動)の場合	*/
+	if(MTR.EVENT == EVT_BLESTART)		/* 通信起動の場合					*/
+/* clk02 chg end															*/
+	{
+		BleStart();						/* BLE通信開始						*/
+
+		StsChg(MSTS_SND);				/* 状態＝データ送信					*/
+
+		ComStart();						/* 通信開始							*/
+
+		MTR.ucREQADV = ON;				/* アドバタイズ要求オン				*/
+	}
+
+	m_intctrl(INT_EI);					/* 割込み許可						*/
+
+	while((MTR.MSTS != MSTS_POFF) && (MTR.ucFAILSAFE == FAILSAFE_INIT))
+	{									/* 電源ONの間のループ				*/
+		Event = m_wait();				/* イベント受信待ち					*/      ここ！
+
+		TMR.ucWDT = TM_WDT;				/* ウォッチドッグタイマ初期化		*/
+		MTR.EVENT = ConvEvent(Event);	/* イベント変換						*/     ここ！
+
+		switch(MTR.EVENT)				/* 以下は関数にせずスタックを節約	*/
+		{
+			case EVT_POFF:				/* 電源OFF							*/
+/* com01 add start															*/
+				StsChg(MSTS_POFF);		/* メイン状態＝電源OFF				*/
+				break;
+/* com01 add end															*/
+
+			case EVT_NOP:				/* 無処理イベント					*/
+				break;					/* 無処理							*/
+
+			default:					/* その他のイベント					*/
+				switch(MTR.MSTS)
+				{
+					case MSTS_PON:		/* 電源ON							*/
+						FnPon();
+						break;
+
+					case MSTS_PAIR:		/* ペアリング						*/
+						FnPair();
+						break;
+
+					case MSTS_SND:		/* データ送信						*/
+						FnSnd();
+						break;
+
+					case MSTS_BLETEST:	/* BLE検査モード					*/
+						FnBleTest();
+						break;
+
+				}
+		}
+		m_release(Event);				/* イベント解放						*/
+	}
+}
+
+lllib.c
+enum	EVT_ID	m_wait(void)
+{
+	while((!INT.ulSTS) && (MTR.ucFAILSAFE == FAILSAFE_INIT))
+	{									/* イベント発生するまでループ		*/
+//		if(P_VCCOFF)					/* アナログVccOFF中のみスタンバイ	*/
+		if(MTR.MSTS == MSTS_POFF)
+		{								/* 電源OFFの場合STOPﾓｰﾄﾞ			*/
+			STOP;
+		}
+		else if(P_VCCOFF)				/* アナログVccOFF中のみスタンバイ	*/
+		{								/* ※荷重カウントモードの0リセット時*/
+			HALT;						/*   の0点カウントふらつき幅を改善	*/
+		}								/*   10cnt(対策前)⇒1cnt(対策後)	*/
+		TMR.ucWDT = TM_WDT;				/* ウォッチドッグタイマ初期化		*/
+	}
+
+										/* 一見スマートではないが			*/
+										/* マイコン内部処理に依存しないよう	*/
+										/* 下記処理としている				*/
+
+	if(INT.BIT.POFF	== ON)				/* 電源OFF							*/
+	{
+		return(EVT_POFF);
+	}
+	if(INT.BIT.FINIT == ON)				/* ファンクション初期				*/
+	{
+		return(EVT_FINIT);
+	}
+	if(INT.BIT.COMRCV == ON)			/* 受信								*/      ここ！
+	{
+		return(EVT_COMRCV);
+	}
+	if(INT.BIT.IMP == ON)				/* インピ							*/
+	{
+		return(EVT_IMP);
+	}
+	if(INT.BIT.WEIT == ON)				/* 荷重								*/
+	{
+		return(EVT_WEIT);
+	}
+
+	return(EVT_NOP);					/* その他の場合は無効イベント		*/
+}
+
+void	m_release(enum EVT_ID Event)
+{
+										/* Event	:イベント				*/
+
+										/* 一見スマートではないが			*/
+										/* 要求ビット制御時のメイン処理と	*/
+										/* 割込み処理間のクロスによる不整合	*/
+										/* を避ける目的で下記処理としている	*/
+
+	switch(Event)						/* 各イベント解放					*/
+	{
+		case EVT_POFF:					/* 電源OFF							*/
+			INT.BIT.POFF	=	OFF;
+			break;
+
+		case EVT_IMP:					/* インピ							*/
+			INT.BIT.IMP		=	OFF;
+			break;
+
+/* hr01 add start															*/
+		case EVT_PULSE:					/* 脈拍								*/
+			INT.BIT.PULSE	 =	OFF;
+			break;
+/* hr01 add end																*/
+
+	}
+}
+
+ConvEvent
+enum EVT_ID	ConvEvent(enum EVT_ID EventIn)
+{
+										/* EventIn	:変換前イベント			*/
+	enum EVT_ID	EventOut;				/* 変換後イベント					*/
+
+	EventOut = EventIn;					/* 変換後イベント初期化				*/
+
+	switch(EventIn)
+	{
+		case EVT_POFF:					/* 電源OFF							*/
+			StsChg(MSTS_POFF);			/* メイン状態＝電源OFF				*/
+			break;
+
+		case EVT_IMP:					/* インピ							*/
+			EventOut = MeasImp();		/* インピ測定						*/     ここ！
+			break;
+
+		case EVT_COMRCV:				/* 受信								*/      ここ！
+			EventOut = ComConvEvent();	/* 通信イベント変換					*/
+			break;
+													*/
+	}
+
+	return(EventOut);					/* 変換後イベント返却				*/
+}
+
+com.c　表示マイコンから測定の指令が来る?
+enum	EVT_ID	ComConvEvent(void)
+{
+	enum EVT_ID	EventOut;				/* 変換後イベント					*/
+	uchar	ucReq;						/* 要求								*/
+	uchar	ucCmd;						/* コマンド							*/
+
+	EventOut = EVT_COMRCV;				/* 変換後イベント初期化(受信)		*/
+
+	if(ComRcv() == OK)
+	{									/* 受信ＯＫの場合					*/
+		ucCmd = (uchar)0;				/* コマンド初期化					*/
+		ucReq = COM.RCV.ucDATA[0];		/* 要求取得							*/
+		pDATA = &COM.RCV.ucDATA[1];		/* データポインタ					*/
+		switch(ucReq)
+		{
+			case COM_END:				/* 通信終了							*/
+				return(EVT_POFF);		/* ｲﾍﾞﾝﾄ返却※ACK返信はしない		*/
+
+			case COM_REQ_VER:			/* バージョンナンバー				*/
+				break;
+
+			case COM_REQ_IMP50:			/* インピ(50kHz)開始				*/
+				COM.ucREQWEIT = OFF;	/* 荷重要求フラグ初期化				*/
+				COM.ucREQIMP = OFF;		/* 要求フラグ初期化					*/
+				COM.ucCNT = (uchar)0;	/* カウンタ初期化					*/
+				ReqAdcEnd();			/* ADC終了							*/
+				m_adcstop();			/* ADC停止							*/
+				HSRAM.ADC.ucSTS = ADC_IMP;
+										/* インピ50kHz						*/
+				break;
+
+			case COM_REQ_IMP5:			/* インピ(5kHz)開始					*/
+				COM.ucREQWEIT = OFF;	/* 荷重要求フラグ初期化				*/
+				COM.ucREQIMP = OFF;		/* 要求フラグ初期化					*/
+				COM.ucCNT = (uchar)0;	/* カウンタ初期化					*/
+				ReqAdcEnd();			/* ADC終了							*/
+				m_adcstop();			/* ADC停止							*/
+				HSRAM.ADC.ucSTS = ADC_IMP_5;
+										/* インピ5kHz						*/
+				break;
+
+			case COM_REQ_IMP:			/* インピ							*/
+				COM.ucREQIMP = ON;		/* 要求フラグオン					*/
+				MEAS.ucOBJ = COM.RCV.ucDATA[1];
+										/* 対象設定							*/
+				if(COM.ucCNT)
+				{
+					P_NPCSELR = MEAS.ucOBJ;
+										/* 測定対象設定						*/
+					TMIF06 = OFF;		/* INTTM06割込み要求クリア			*/
+					TMMK06 = OFF;		/* INTTM06割込み許可				*/
+				}
+				else
+				{
+					ReqAdcStart(HSRAM.ADC.ucSTS);
+										/* インピ測定						*/      ここ！
+					COM.ucCNT = (uchar)1;
+				}
+
+				return(EventOut);		/* ｲﾍﾞﾝﾄ返却※ACK返信はここでしない	*/
+
+			default:					/* その他の場合						*/
+				break;
+		}
+
+		if(ComSnd(ucReq, ucCmd) == NG)	/* ACK送信							*/
+		{
+			EventOut = EVT_POFF;		/* 電源OFFイベント					*/
+		}
+	}
+	return(EventOut);					/* 変換後イベント返却				*/
+}
+
+
+req_adc.c
+void	ReqAdcStart(uchar ucType)
+{
+										/* ucType	:ADC種別				*/
+
+	m_vcc(ucType);						/* VccON							*/
+	m_adcinit();						/* ADC初期化						*/
+	HSRAM.ADC.ucSTS = ucType;			/* ADC状態設定						*/
+
+	switch(ucType)
+	{
+		case ADC_TEMP:					/* 温度								*/
+			m_adcinitvolt();			/* ADC初期化（電圧）				*/
+			INT.BIT.TEMP = OFF;			/* 温度割込クリア					*/
+			INT.BIT.WEIT = OFF;			/* 荷重割込クリア					*/
+										/* ※カウントモードで秤から温度に	*/
+										/*   切り替える際に解放が必要かも	*/
+										/*   （温度開始後に秤イベント処理	*/
+										/*    がされてしまう可能性がある為）*/
+			break;
+
+		case ADC_IMP:					/* インピ50kHz						*/
+		case ADC_IMP_5:					/* インピ5kHz						*/
+										/* 高速ＲＡＭは初期化不要			*/
+			s_memset(&ADC.IMP.SUM, (uchar)0, sizeof(struct ADC_IMP_SUM_T));
+			s_memset(&ADC.IMP.STORE, (uchar)0,
+										sizeof(struct ADC_IMP_STORE_T));
+			s_memset(&ADC.IMP.LAST[MEAS.ucOBJ], (uchar)0,
+										sizeof(struct IMP_T));
+			s_memset(&ADC.IMP.THIS[MEAS.ucOBJ], (uchar)0,
+										sizeof(struct IMP_T));
+										/* ADC情報初期化					*/
+
+			MEAS.ucCNT = (uchar)0;		/* 測定回数初期化					*/
+			MEAS.ucAVGCNT = (uchar)0;	/* 平均回数初期化					*/
+			MEAS.ucSTBCNT = (uchar)0;	/* 安定回数初期化					*/
+			INT.BIT.IMP = OFF;			/* インピ割込クリア					*/
+			INT.BIT.WEIT = OFF;			/* 荷重割込クリア					*/
+										/* ※通常動作では問題ないが、		*/
+										/*   カウントモードで秤からインピに	*/
+										/*   切り替える際に解放が必要かも	*/
+										/*   （インピ開始後に秤イベント処理	*/
+										/*    がされてしまう可能性がある為）*/
+			break;
+
+
+/* hr01 add end																*/
+	}
+
+	m_adcset(ucType);					/* ADC設定							*/
+}
+
+lllib.c
+void	m_adcset(uchar ucType)
+{
+										/* ucType	:ADC種別				*/
+
+	ushort	usTmr;						/* タイマ値							*/
+
+	switch(ucType)
+	{
+		case ADC_IMP:					/* インピ							*/
+		case ADC_IMP_5:					/* インピ5kHz						*/
+			DI;							/* 割込み禁止						*/
+			ADMK = ON;					/* ADC割込み禁止					*/
+			ADCS = OFF;					/* ADC動作停止						*/
+			ADCE = OFF;					/* ADCコンパレータ動作停止			*/
+			ADM1 |= 0x80;				/* ﾊｰﾄﾞﾄﾘｶﾞ・ﾉｰｳｪｲﾄ・ﾓｰﾄﾞに切換え	*/
+			ADCE = ON;					/* ADCコンパレータ動作開始			*/
+			usTmr = ADC_START_WAIT;		/* ＡＤ動作安定待ち					*/
+			while(usTmr--)
+			{
+				NOP;
+			}
+
+			P_NPCSELR = MEAS.ucOBJ;		/* 測定対象設定						*/
+			if(ucType == ADC_IMP)
+			{
+				P_NPCSELF = IMP_FREQ_50KHZ;
+										/* 測定周波数50kHz					*/
+				TDR01 = TMR_IMP_AD_50;	/* インピADトリガ					*/
+				TDR06 = TMR_IMP_SYNC_50;/* インピ同期タイマ					*/
+			}
+			else
+			{
+				P_NPCSELF = IMP_FREQ_5KHZ;
+										/* 測定周波数5kHz					*/
+				TDR01 = TMR_IMP_AD_5;	/* インピADトリガ					*/
+				TDR06 = TMR_IMP_SYNC_5;	/* インピ同期タイマ					*/
+			}
+
+			m_impstart();				/* インピ測定開始					*/     ここ！
+
+			EI;							/* 割込み許可						*/
+			break;
+    }
+}
+
+void	m_impstart(void)
+{
+	ADC.IMP.SUM.ucDIZCNT = DIZZER_CNT_INIT;
+										/* 偏移電圧カウンタ初期化			*/
+	m_dizzerset();						/* 偏移電圧設定						*/
+
+	ADMK = OFF;							/* AD割り込み許可					*/
+
+	m_intmask(INT_TMR_DI);				/* ベースタイマ割込禁止				*/
+
+										/* チャネル6（インピ同期タイマ）	*/
+	TMIF06 = OFF;						/* INTTM06割込み要求クリア			*/
+	TMMK06 = OFF;						/* INTTM06割込み許可				*/
+	TS0 |= 0x0040;						/* カウント動作開始					*/
+
+	while(!TMIF06){}					/* １回目の同期タイマくるまでまつ	*/
+
+	P_NPCSTART = ON;					/* 正弦波出力開始					*/    ここ！
+
+										/* チャネル5（カスタムクロック）	*/
+										/* チャネル1（インピADトリガ）		*/
+	TOE0 |= 0x0020;						/* 出力動作許可						*/　　タイマ出力
+	TS0 |= 0x0022;						/* カウント動作開始					*/
+
+	m_intmask(INT_TMR_EI);				/* ベースタイマ割込許可				*/
+
+	ADMK = ON;							/* ADC割込み禁止					*/
+}
+
+int.c 割り込み
+#pragma	interrupt	IntImpCnt( vect=INTTM06 )
+void	IntImpCnt(void)
+{
+	uchar store_count;					/* 積算回数							*/
+	uchar data_count;					/* AD取得数							*/
+
+	if(!INT.BIT.IMP)					/* 前回インピ割込が処理済の場合		*/
+	{
+		store_count = ADC_IMP_STORE_MAX;/* 積算回数設定						*/
+
+		ADCS = OFF;						/* AD変換動作停止					*/
+		ADS = ADC_IMP;					/* チャンネルをインピに切り替え		*/
+		ADM1 |= 0x80;					/* ADをハードトリガへ				*/
+
+		TMIF06 = OFF;					/* 同期タイマ割り込みフラグクリア	*/
+		while(!TMIF06){}				/* タイマ割り込み待ち				*/
+
+		TMIF06 = OFF;					/* 同期タイマ割り込みフラグクリア	*/
+		while(!TMIF06){}				/* タイマ割り込み待ち				*/
+
+		ADCS = ON;						/* AD変換動作開始					*/
+
+		ADIF = OFF;						/* AD変換割込み要求クリア 			*/
+		while(!ADIF){}
+
+		ADIF = OFF;						/* AD変換割込み要求クリア 			*/
+		while(!ADIF){}
+
+		ADIF = OFF;						/* AD変換割込み要求クリア 			*/
+		while(!ADIF){}
+
+		while(store_count--)            /* AD割り込みきてからfor文抜けて    */
+		{								/* AD待ちになるまで約3us弱          */
+			for(data_count = 0; data_count < IMP_DATA_NUM; data_count++)
+			{
+				ADIF = OFF;
+				while(!ADIF){}
+				ADC.IMP.SUM.ulDATA[data_count] += ADCR>>6;
+										/* AD取得							*/     ここ！
+			}
+		}
+
+		ADCS = OFF;						/* AD変換動作停止					*/
+/* batt02 del start															*/
+/*		ADS = ADC_VOLT;					 * チャンネルを電圧に切り替え		*/
+/*		ADM1 &= 0x7F;					 * ADをソフトウェアトリガへ			*/
+/*		ADIF = OFF;						 * AD変換割込み要求クリア 			*/
+/*		ADCS = ON;						 * AD変換動作開始					*/
+/* batt02 del end															*/
+		INT.BIT.IMP = ON;				/* インピ割込設定					*/     ここ！
+	}
+}
+
+#pragma interrupt	IntAdc( vect=INTAD )
+void	IntAdc(void)
+{
+	uchar	ucCnt;						/* ucCnt	:ローカルカウンタ		*/
+	ushort	usSum;						/* usSum 	:積算バッファ			*/
+
+	if((ADS == ADC_STPON) && !(INT.BIT.STPWEIT))
+	{									/* ステップ荷重の場合				*/
+		usSum = (ushort)(ADCR / (ushort)64);
+										/* ADC値取得						*/
+		for(ucCnt = ADC_SUMCNT_STPON; ucCnt > (uchar)0; ucCnt--)
+		{								/* 積算回数分ループ					*/
+			ADCS = ON;					/* 変換開始							*/
+			while(!ADIF)				/* ＡＤ変換完了まで待機				*/
+			{
+			}
+			usSum += (ushort)(ADCR / (ushort)64);
+										/* ADC値取得						*/
+			ADIF = OFF;					/* ADC割込み要求初期化				*/
+		}
+		P_VCCOFF = ON;					/* ＶｃｃOFF						*/
+		HSRAM.ADC.SAR.usSTPON = usSum;	/* ADC値取得						*/
+		INT.BIT.STPWEIT = ON;			/* ステップ荷重割込設定				*/
+	}
+/* hr01 add start															*/
+	else if((ADS == ADC_PULSE) && (HR.ucSTS == HR_STS_ON))
+	{									/* 脈拍測定の場合					*/
+		HR.sDATA_P0 = (short)(ADCR / (ushort)64);
+//		HR.usDATA_P0 = (ushort)(ADCR / (ushort)64);
+										/* ADC値取得						*/
+
+		HR.ucSTS = HR_STS_OFF;			/* フラグＯＦＦ						*/
+
+		HR.usTIME++;					/* ｻﾝﾌﾟﾘﾝｸﾞ回数+1（タイマ代わり）	*/
+
+		INT.BIT.PULSE = ON;				/* 脈拍割り込み設定					*/
+	}
+/* hr01 add end																*/
+
+	ADCS = OFF;							/* 変換動作停止						*/
+}
+
+
+
+
+→MeasImp()　　　偏移加算の完了とDFT
+enum EVT_ID	MeasImp(void)
+{
+	struct	IMP_T	*pImp;				/* インピポインタ					*/
+
+	if(((HSRAM.ADC.ucSTS == ADC_IMP)
+		&& (ADC.IMP.SUM.ucDIZCNT > (uchar)(MAX_IMP_DIZZER - DIZZER_STEP_50)))
+		|| ((HSRAM.ADC.ucSTS == ADC_IMP_5)
+		&& (ADC.IMP.SUM.ucDIZCNT > (uchar)(MAX_IMP_DIZZER - DIZZER_STEP_5))))
+	{									/* 偏移電圧積算完了の場合			*/
+		pImp = &ADC.IMP.THIS[MEAS.ucOBJ];
+										/* インピポインタ取得				*/
+
+		Dft(pImp, ADC.IMP.SUM.ulDATA);	/* ＤＦＴ							*/
+
+
+		if(COM.ucREQIMP == ON)
+		{								/* 要求ありの場合					*/
+			ComSnd(COM_REQ_IMP, 0);		/* インピデータ送信					*/
+			COM.ucREQIMP = OFF;			/* 要求フラグ初期化					*/
+		}
+
+		TMMK06 = ON;					/*		INTTM06割込み禁止			*/     ここで止めるまでインピ測定は続く
+
+
+		s_memset(&ADC.IMP.SUM.ulDATA, (uchar)0,
+										sizeof(ADC.IMP.SUM.ulDATA));
+										/* インピ積算情報初期化				*/
+		ADC.IMP.SUM.ucDIZCNT = DIZZER_CNT_INIT;
+										/* 偏移電圧カウンタ初期化			*/
+		m_dizzerset();					/* 偏移電圧設定						*/
+
+		return(EVT_IMP);				/* 有効イベント						*/
+	}
+
+	ADC.IMP.SUM.ucDIZCNT += (uchar)((HSRAM.ADC.ucSTS == ADC_IMP)
+									? DIZZER_STEP_50 : DIZZER_STEP_5);
+
+	m_dizzerset();						/* 偏移電圧設定						*/
+
+	return(EVT_NOP);					/* 未完了の場合は無効イベント		*/     ここ！
+}
+
+
+lllib.c
+										/* チャネル5						*/
+	TMR05	= (ushort)0x0000;			/* 動作クロックCK00	ｲﾝﾀｰﾊﾞﾙﾀｲﾏ		*/
+	TDR05	= TMR_NPC_CLK;				/* TO05 NPC CLK（タイマ出力）		*/
+
+										/* チャネル6						*/
+	TMR06	= (ushort)0x0000;			/* 動作クロックCK00	ｲﾝﾀｰﾊﾞﾙﾀｲﾏ		*/
+	TDR06	= TMR_IMP_SYNC_50;			/* インピ同期タイマ					*/
+
+lllib.h
+#define	TMR_NPC_CLK		(uchar)(2 - 1)	/* NPC_CLK出力:4MHz					*/
+										/*	(2*1)/16MHz=125ns⇒4MHz			*/
+#define	TMR_IMP_SYNC_50	(ushort)(4480 - 1)
+										/* 4480/16MHz=280us毎に割り込み		*/
+#define	TMR_IMP_AD_50	(ushort)(112 - 1)
+										/* 112/16MHz=7us毎	ADトリガ		*/
+#define	TMR_IMP_SYNC_5	(ushort)(19200 - 1)
+										/* 19200/16MHz=1200us毎に割り込み	*/
+#define	TMR_IMP_AD_5	(ushort)(480 - 1)
+										/* 480/16MHz=30us毎	ADトリガ		*/
+										
